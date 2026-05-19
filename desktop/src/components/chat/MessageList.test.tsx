@@ -6,6 +6,7 @@ import { sessionsApi } from '../../api/sessions'
 import { useChatStore } from '../../stores/chatStore'
 import { useWorkspaceChatContextStore } from '../../stores/workspaceChatContextStore'
 import { useSettingsStore } from '../../stores/settingsStore'
+import { useSessionStore } from '../../stores/sessionStore'
 import { useTabStore } from '../../stores/tabStore'
 import { useUIStore } from '../../stores/uiStore'
 import type { UIMessage } from '../../types/chat'
@@ -105,6 +106,7 @@ describe('MessageList nested tool calls', () => {
     useSettingsStore.setState({ locale: 'en' })
     useUIStore.setState({ pendingSettingsTab: null })
     useTabStore.setState({ activeTabId: ACTIVE_TAB, tabs: [{ sessionId: ACTIVE_TAB, title: 'Test', type: 'session' as const, status: 'idle' }] })
+    useSessionStore.setState({ sessions: [], activeSessionId: null, isLoading: false, error: null })
     useChatStore.setState({ sessions: { [ACTIVE_TAB]: makeSessionState() } })
     useWorkspaceChatContextStore.setState(useWorkspaceChatContextStore.getInitialState(), true)
     vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockImplementation(
@@ -200,7 +202,7 @@ describe('MessageList nested tool calls', () => {
     expect(screen.getByText('Budget: 0 / unlimited tokens')).toBeTruthy()
   })
 
-  it('renders background agent progress inline in the transcript', () => {
+  it('renders non-agent background progress inline in the transcript', () => {
     useChatStore.setState({
       sessions: {
         [ACTIVE_TAB]: makeSessionState({
@@ -212,14 +214,14 @@ describe('MessageList nested tool calls', () => {
               timestamp: 1,
             },
             {
-              id: 'background-task-agent-1',
+              id: 'background-task-shell-1',
               type: 'background_task',
               timestamp: 2,
               task: {
-                taskId: 'agent-task-1',
-                toolUseId: 'agent-tool-1',
+                taskId: 'shell-task-1',
+                toolUseId: 'shell-tool-1',
                 status: 'running',
-                taskType: 'local_agent',
+                taskType: 'local_bash',
                 summary: 'Running Playwright checks',
                 usage: {
                   totalTokens: 1200,
@@ -244,27 +246,27 @@ describe('MessageList nested tool calls', () => {
     render(<MessageList />)
 
     const card = screen.getByTestId('background-task-event-card')
-    expect(card.textContent).toContain('local_agent')
+    expect(card.textContent).toContain('Background command')
     expect(card.textContent).toContain('running')
     expect(card.textContent).toContain('Running Playwright checks')
     expect(card.textContent).toContain('1,200 tokens')
     expect(card.textContent).toContain('45s')
   })
 
-  it('renders stopped background agents as neutral transcript events', () => {
+  it('renders stopped non-agent background tasks as neutral transcript events', () => {
     useChatStore.setState({
       sessions: {
         [ACTIVE_TAB]: makeSessionState({
           messages: [{
-            id: 'background-task-agent-stopped',
+            id: 'background-task-shell-stopped',
             type: 'background_task',
             timestamp: 2,
             task: {
-              taskId: 'agent-task-stopped',
-              toolUseId: 'agent-tool-stopped',
+              taskId: 'shell-task-stopped',
+              toolUseId: 'shell-tool-stopped',
               status: 'stopped',
-              taskType: 'local_agent',
-              summary: 'Agent "Code review for todo app" was stopped',
+              taskType: 'local_bash',
+              summary: 'Command "bun test" was stopped',
               startedAt: 1,
               updatedAt: 2,
             },
@@ -279,6 +281,77 @@ describe('MessageList nested tool calls', () => {
     expect(card.getAttribute('data-status')).toBe('stopped')
     expect(card.textContent).toContain('stopped')
     expect(card.querySelector('.text-\\[var\\(--color-error\\)\\]')).toBeNull()
+  })
+
+  it('uses user-facing labels for workflow and unknown background tasks', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'background-task-workflow',
+              type: 'background_task',
+              timestamp: 2,
+              task: {
+                taskId: 'workflow-task',
+                status: 'running',
+                taskType: 'local_workflow',
+                summary: 'Running release checklist',
+                startedAt: 1,
+                updatedAt: 2,
+              },
+            },
+            {
+              id: 'background-task-unknown',
+              type: 'background_task',
+              timestamp: 3,
+              task: {
+                taskId: 'unknown-task',
+                status: 'completed',
+                summary: 'Finished background work',
+                startedAt: 1,
+                updatedAt: 3,
+              },
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    const cards = screen.getAllByTestId('background-task-event-card')
+    expect(cards).toHaveLength(2)
+    expect(cards[0]?.textContent).toContain('Background workflow')
+    expect(cards[1]?.textContent).toContain('Background task')
+  })
+
+  it('does not render agent background task events as separate transcript cards', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [{
+            id: 'background-task-agent-hidden',
+            type: 'background_task',
+            timestamp: 2,
+            task: {
+              taskId: 'agent-task-hidden',
+              toolUseId: 'agent-tool-hidden',
+              status: 'running',
+              taskType: 'local_agent',
+              summary: 'Running Read',
+              startedAt: 1,
+              updatedAt: 2,
+            },
+          }],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    expect(screen.queryByTestId('background-task-event-card')).toBeNull()
+    expect(screen.queryByText('local_agent')).toBeNull()
   })
 
   it('restores the full transcript when scrolling away from latest', async () => {
@@ -700,6 +773,68 @@ describe('MessageList nested tool calls', () => {
     expect(toolGroups.map((item) => item.toolCalls[0]?.toolUseId)).toEqual(['agent-1', 'write-1'])
   })
 
+  it('keeps task-management tools from downgrading dispatched agents into a mixed tool tree', () => {
+    const messages: UIMessage[] = [
+      {
+        id: 'tool-task-create',
+        type: 'tool_use',
+        toolName: 'TaskCreate',
+        toolUseId: 'task-create-1',
+        input: { subject: 'Review recent changes' },
+        timestamp: 1,
+      },
+      {
+        id: 'tool-task-update',
+        type: 'tool_use',
+        toolName: 'TaskUpdate',
+        toolUseId: 'task-update-1',
+        input: { id: '1', status: 'in_progress' },
+        timestamp: 2,
+      },
+      {
+        id: 'tool-agent-a',
+        type: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'agent-a',
+        input: { description: 'Review desktop impact' },
+        timestamp: 3,
+      },
+      {
+        id: 'tool-agent-b',
+        type: 'tool_use',
+        toolName: 'Agent',
+        toolUseId: 'agent-b',
+        input: { description: 'Review runtime impact' },
+        timestamp: 4,
+      },
+      {
+        id: 'tool-agent-child-bash',
+        type: 'tool_use',
+        toolName: 'Bash',
+        toolUseId: 'agent-a-bash',
+        input: { command: 'git status --short' },
+        timestamp: 5,
+        parentToolUseId: 'agent-a',
+      },
+    ]
+
+    const { renderItems, childToolCallsByParent } = buildRenderModel(messages)
+    const toolGroups = renderItems.filter((item) => item.kind === 'tool_group')
+
+    expect(toolGroups).toHaveLength(2)
+    expect(toolGroups[0]?.toolCalls.map((toolCall) => toolCall.toolName)).toEqual([
+      'TaskCreate',
+      'TaskUpdate',
+    ])
+    expect(toolGroups[1]?.toolCalls.map((toolCall) => toolCall.toolName)).toEqual([
+      'Agent',
+      'Agent',
+    ])
+    expect(childToolCallsByParent.get('agent-a')?.map((toolCall) => toolCall.toolUseId)).toEqual([
+      'agent-a-bash',
+    ])
+  })
+
   it('keeps later nested tool calls under their parent after an interleaved user message', () => {
     const messages: UIMessage[] = [
       {
@@ -894,6 +1029,175 @@ describe('MessageList nested tool calls', () => {
     expect(screen.getAllByText('Running').length).toBeGreaterThan(0)
     expect(screen.queryByText('Done')).toBeNull()
     expect(screen.queryByRole('button', { name: 'View result' })).toBeNull()
+  })
+
+  it('shows completed background agent result from the terminal task notification', () => {
+    const resultText = '后台 agent 已经完成：定位到 parentToolUseId 丢失并补齐了 live 事件链。'
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'tool-agent',
+              type: 'tool_use',
+              toolName: 'Agent',
+              toolUseId: 'agent-1',
+              input: { description: '排查 subagent UI' },
+              timestamp: 1,
+            },
+            {
+              id: 'result-agent',
+              type: 'tool_result',
+              toolUseId: 'agent-1',
+              content:
+                "Async agent launched successfully.\nagentId: a29934b04b20ed564 (internal ID - do not mention to user. Use SendMessage with to: 'a29934b04b20ed564' to continue this agent.)\nThe agent is working in the background. You will be notified automatically when it completes.",
+              isError: false,
+              timestamp: 2,
+            },
+          ],
+          agentTaskNotifications: {
+            'agent-1': {
+              taskId: 'agent-task-1',
+              toolUseId: 'agent-1',
+              status: 'completed',
+              summary: 'Agent "排查 subagent UI" completed',
+              result: resultText,
+            },
+          },
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    expect(screen.getByText('Done')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'View result' }))
+
+    expect(within(screen.getByRole('dialog')).getByText(resultText)).toBeTruthy()
+  })
+
+  it('prefers the terminal task report over structured agent tool result JSON', () => {
+    const markdownReport = '## 审查安全风险\n\n- 最终报告应该按 Markdown 展示。'
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'tool-agent',
+              type: 'tool_use',
+              toolName: 'Agent',
+              toolUseId: 'agent-1',
+              input: { description: '查看安全报告' },
+              timestamp: 1,
+            },
+            {
+              id: 'result-agent',
+              type: 'tool_result',
+              toolUseId: 'agent-1',
+              content: {
+                results: [
+                  {
+                    file: 'git:v0.2.6..v0.2.7',
+                    line: 0,
+                    snippet: 'raw structured JSON should not be shown',
+                    context: '结构化检索结果不是给用户看的最终报告。',
+                  },
+                ],
+              },
+              isError: false,
+              timestamp: 2,
+            },
+          ],
+          agentTaskNotifications: {
+            'agent-1': {
+              taskId: 'agent-task-1',
+              toolUseId: 'agent-1',
+              status: 'completed',
+              summary: 'Agent "审查安全风险" completed',
+              result: markdownReport,
+            },
+          },
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    expect(screen.getByText(/最终报告应该按 Markdown 展示。/)).toBeTruthy()
+    expect(screen.queryByText(/raw structured JSON should not be shown/)).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'View result' }))
+
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByRole('heading', { name: '审查安全风险' })).toBeTruthy()
+    expect(within(dialog).getByText('最终报告应该按 Markdown 展示。')).toBeTruthy()
+    expect(within(dialog).queryByText(/raw structured JSON should not be shown/)).toBeNull()
+  })
+
+  it('formats structured agent fallback results as readable markdown', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'tool-agent',
+              type: 'tool_use',
+              toolName: 'Agent',
+              toolUseId: 'agent-1',
+              input: { description: '审查安全风险' },
+              timestamp: 1,
+            },
+            {
+              id: 'result-agent',
+              type: 'tool_result',
+              toolUseId: 'agent-1',
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({
+                    results: [
+                      {
+                        file: 'git:v0.2.6..v0.2.7',
+                        line: 0,
+                        snippet: 'v0.2.7 tag = a4c92ec7',
+                        context: '版本范围判断：release-notes/v0.2.7.md 明确相比 v0.2.6。',
+                      },
+                      {
+                        risk: 'medium',
+                        items: [
+                          {
+                            file: '/tmp/example/src/lib.rs',
+                            line: 220,
+                            context: '中风险：服务默认监听 0.0.0.0。',
+                          },
+                        ],
+                      },
+                    ],
+                  }),
+                },
+              ],
+              isError: false,
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    expect(screen.getByText(/git:v0\.2\.6\.\.v0\.2\.7:0/)).toBeTruthy()
+    expect(screen.queryByText(/\{"results"/)).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'View result' }))
+
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByText('git:v0.2.6..v0.2.7:0')).toBeTruthy()
+    expect(within(dialog).getByText('/tmp/example/src/lib.rs:220')).toBeTruthy()
+    expect(within(dialog).getByText(/服务默认监听 0\.0\.0\.0/)).toBeTruthy()
+    expect(within(dialog).queryByText(/\{"results"/)).toBeNull()
   })
 
   it('renders copy controls for user messages and scopes assistant copy to a single reply', async () => {
@@ -1986,6 +2290,107 @@ describe('MessageList nested tool calls', () => {
 
     expect(await screen.findByRole('button', { name: 'Undo current turn changes' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Rewind to here' })).toBeNull()
+  })
+
+  it('branches from completed transcript-backed chat messages using the original transcript id', async () => {
+    const branchSession = vi.fn().mockResolvedValue({
+      sessionId: 'branched-session-1',
+      title: 'Branched session',
+      workDir: '/tmp/branched-session-1',
+    })
+    const connectToSession = vi.fn()
+    useSessionStore.setState({
+      sessions: [{
+        id: ACTIVE_TAB,
+        title: 'Source session',
+        createdAt: '2026-05-19T00:00:00.000Z',
+        modifiedAt: '2026-05-19T00:00:00.000Z',
+        messageCount: 2,
+        projectPath: '/tmp/source-project',
+        projectRoot: '/tmp/source-project',
+        workDir: '/tmp/source-project',
+        workDirExists: true,
+      }],
+      branchSession: branchSession as never,
+    })
+    useChatStore.setState({
+      connectToSession: connectToSession as never,
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'local-user-1',
+              transcriptMessageId: 'transcript-user-1',
+              type: 'user_text',
+              content: '从这里开始',
+              timestamp: 1,
+            },
+            {
+              id: 'local-assistant-1',
+              transcriptMessageId: 'transcript-assistant-1',
+              type: 'assistant_text',
+              content: '这是完成的答复。',
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    const branchButtons = screen.getAllByRole('button', { name: 'Branch from here' })
+    expect(branchButtons).toHaveLength(2)
+
+    fireEvent.click(branchButtons[1]!)
+
+    await waitFor(() => {
+      expect(branchSession).toHaveBeenCalledWith(ACTIVE_TAB, 'transcript-assistant-1')
+    })
+    expect(connectToSession).toHaveBeenCalledWith('branched-session-1')
+    expect(useTabStore.getState().activeTabId).toBe('branched-session-1')
+    const tabs = useTabStore.getState().tabs
+    expect(tabs[tabs.length - 1]).toMatchObject({
+      sessionId: 'branched-session-1',
+      title: 'Branched session',
+      type: 'session',
+    })
+    const toasts = useUIStore.getState().toasts
+    expect(toasts[toasts.length - 1]).toMatchObject({
+      type: 'success',
+      message: 'Created branched session "Branched session".',
+    })
+  })
+
+  it('hides branch actions while the current session is still running', () => {
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          chatState: 'streaming',
+          streamingText: 'partial',
+          messages: [
+            {
+              id: 'local-user-1',
+              transcriptMessageId: 'transcript-user-1',
+              type: 'user_text',
+              content: '从这里开始',
+              timestamp: 1,
+            },
+            {
+              id: 'local-assistant-1',
+              transcriptMessageId: 'transcript-assistant-1',
+              type: 'assistant_text',
+              content: '这是完成的答复。',
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    expect(screen.queryByRole('button', { name: 'Branch from here' })).toBeNull()
   })
 
   it('keeps historical sessions readable when turn checkpoint payloads are missing', async () => {

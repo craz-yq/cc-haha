@@ -144,6 +144,7 @@ type ChatStore = {
 
 const TASK_TOOL_NAMES = new Set(['TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TodoWrite'])
 const pendingTaskToolUseIdsBySession = new Map<string, Set<string>>()
+const pendingToolParentUseIdsBySession = new Map<string, Map<string, string>>()
 
 function addPendingTaskToolUseId(sessionId: string, toolUseId: string): void {
   const ids = pendingTaskToolUseIdsBySession.get(sessionId) ?? new Set<string>()
@@ -161,6 +162,34 @@ function consumePendingTaskToolUseId(sessionId: string, toolUseId: string): bool
 
 function clearPendingTaskToolUseIds(sessionId: string): void {
   pendingTaskToolUseIdsBySession.delete(sessionId)
+}
+
+function rememberPendingToolParentUseId(
+  sessionId: string,
+  toolUseId: string | null | undefined,
+  parentToolUseId: string | undefined,
+): void {
+  if (!toolUseId || !parentToolUseId) return
+  const parentUseIds = pendingToolParentUseIdsBySession.get(sessionId) ?? new Map<string, string>()
+  parentUseIds.set(toolUseId, parentToolUseId)
+  pendingToolParentUseIdsBySession.set(sessionId, parentUseIds)
+}
+
+function getPendingToolParentUseId(sessionId: string, toolUseId: string): string | undefined {
+  return pendingToolParentUseIdsBySession.get(sessionId)?.get(toolUseId)
+}
+
+function consumePendingToolParentUseId(sessionId: string, toolUseId: string): string | undefined {
+  const parentUseIds = pendingToolParentUseIdsBySession.get(sessionId)
+  if (!parentUseIds) return undefined
+  const parentToolUseId = parentUseIds.get(toolUseId)
+  parentUseIds.delete(toolUseId)
+  if (parentUseIds.size === 0) pendingToolParentUseIdsBySession.delete(sessionId)
+  return parentToolUseId
+}
+
+function clearPendingToolParentUseIds(sessionId: string): void {
+  pendingToolParentUseIdsBySession.delete(sessionId)
 }
 const AGENT_COMPLETION_NOTIFICATION_PREVIEW_CHARS = 160
 
@@ -204,15 +233,26 @@ function appendAssistantTextMessage(
   content: string,
   timestamp: number,
   model?: string,
+  transcriptMessageId?: string,
 ): UIMessage[] {
   if (!content.trim()) return messages
 
   const last = messages[messages.length - 1]
-  if (last?.type === 'assistant_text') {
+  const canMergeIntoLast =
+    last?.type === 'assistant_text' &&
+    (
+      transcriptMessageId
+        ? last.transcriptMessageId === transcriptMessageId
+        : !last.transcriptMessageId
+    )
+  if (canMergeIntoLast) {
     const merged: UIMessage = {
       ...last,
       content: last.content + content,
       ...(model ?? last.model ? { model: model ?? last.model } : {}),
+      ...(transcriptMessageId ?? last.transcriptMessageId
+        ? { transcriptMessageId: transcriptMessageId ?? last.transcriptMessageId }
+        : {}),
     }
     return [...messages.slice(0, -1), merged]
   }
@@ -224,6 +264,7 @@ function appendAssistantTextMessage(
       type: 'assistant_text',
       content,
       timestamp,
+      ...(transcriptMessageId ? { transcriptMessageId } : {}),
       ...(model ? { model } : {}),
     },
   ]
@@ -234,10 +275,17 @@ function upsertBackgroundTaskMessage(
   task: BackgroundAgentTask,
   timestamp: number,
 ): UIMessage[] {
-  const existingIndex = messages.findIndex((message) =>
+  const isSameTaskMessage = (message: UIMessage) =>
     message.type === 'background_task' &&
     (message.task.taskId === task.taskId ||
-      (task.toolUseId && message.task.toolUseId === task.toolUseId)))
+      (task.toolUseId && message.task.toolUseId === task.toolUseId))
+
+  if (isAgentBackgroundTask(task)) {
+    return messages.filter((message) => !isSameTaskMessage(message))
+  }
+
+  const existingIndex = messages.findIndex((message) =>
+    isSameTaskMessage(message))
   if (existingIndex === -1) {
     return [...messages, {
       id: `background-task-${task.taskId}`,
@@ -264,6 +312,15 @@ function mergeBackgroundTaskMessages(
   return [...merged].sort((a, b) => a.timestamp - b.timestamp)
 }
 
+function isAgentBackgroundTask(task: Pick<BackgroundAgentTask, 'taskType' | 'summary'>): boolean {
+  if (task.taskType === 'local_agent' || task.taskType === 'remote_agent') {
+    return true
+  }
+  return /^Agent (?:(?:"[^"]+" )?(completed|was stopped)|(?:"[^"]+" )?failed(?::|$))/.test(
+    task.summary ?? '',
+  )
+}
+
 function mergeRestoredTerminalGoalEvents(
   messages: UIMessage[],
   restoredMessages: UIMessage[],
@@ -283,6 +340,91 @@ function mergeRestoredTerminalGoalEvents(
   return missingTerminalEvents.length > 0
     ? [...messages, ...missingTerminalEvents]
     : messages
+}
+
+function mergeRestoredTranscriptMessageIds(
+  messages: UIMessage[],
+  restoredMessages: UIMessage[],
+): UIMessage[] {
+  const restoredCandidates = restoredMessages.filter((
+    message,
+  ): message is Extract<UIMessage, { type: 'user_text' | 'assistant_text' }> =>
+    (message.type === 'user_text' || message.type === 'assistant_text') &&
+    typeof message.transcriptMessageId === 'string' &&
+    message.transcriptMessageId.length > 0)
+
+  if (restoredCandidates.length === 0) return messages
+
+  let restoredCursor = 0
+  let changed = false
+  const merged = messages.map((message) => {
+    if (
+      (message.type !== 'user_text' && message.type !== 'assistant_text') ||
+      message.transcriptMessageId
+    ) {
+      return message
+    }
+
+    const matchIndex = restoredCandidates.findIndex((candidate, index) =>
+      index >= restoredCursor &&
+      candidate.type === message.type &&
+      candidate.content.trim() === message.content.trim())
+
+    if (matchIndex === -1) return message
+
+    restoredCursor = matchIndex + 1
+    changed = true
+    return {
+      ...message,
+      transcriptMessageId: restoredCandidates[matchIndex]!.transcriptMessageId,
+    }
+  })
+
+  return changed ? merged : messages
+}
+
+function mergeRestoredHistoryIntoLiveMessages(
+  messages: UIMessage[],
+  restoredMessages: UIMessage[],
+): UIMessage[] {
+  return mergeRestoredTerminalGoalEvents(
+    mergeRestoredTranscriptMessageIds(messages, restoredMessages),
+    restoredMessages,
+  )
+}
+
+function needsTranscriptIdHydrationRetry(session: PerSessionState | undefined): boolean {
+  if (!session || session.chatState !== 'idle') return false
+
+  let currentTurnHasHydratedUser = false
+  for (const message of session.messages) {
+    if (message.type === 'user_text') {
+      currentTurnHasHydratedUser = Boolean(message.transcriptMessageId)
+      continue
+    }
+    if (
+      currentTurnHasHydratedUser &&
+      message.type === 'assistant_text' &&
+      !message.transcriptMessageId
+    ) {
+      return true
+    }
+  }
+
+  return false
+}
+
+function refreshCompletedTranscriptHistory(
+  get: () => ChatStore,
+  sessionId: string,
+): void {
+  void get().loadHistory(sessionId).then(() => {
+    if (!needsTranscriptIdHydrationRetry(get().sessions[sessionId])) return
+    setTimeout(() => {
+      if (!needsTranscriptIdHydrationRetry(get().sessions[sessionId])) return
+      void get().loadHistory(sessionId)
+    }, 750)
+  })
 }
 
 function normalizeMemoryEventFiles(data: unknown): MemoryEventFile[] {
@@ -457,6 +599,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, (sess) => ({ streamingText: sess.streamingText + text })) }))
     }
     clearPendingTaskToolUseIds(sessionId)
+    clearPendingToolParentUseIds(sessionId)
     wsManager.disconnect(sessionId)
     set((s) => {
       const { [sessionId]: _, ...rest } = s.sessions
@@ -659,7 +802,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
               s.backgroundAgentTasks ?? {},
               restoredBackgroundTasks,
             ),
-            messages: mergeRestoredTerminalGoalEvents(
+            messages: mergeRestoredHistoryIntoLiveMessages(
               mergeBackgroundTaskMessages(s.messages, restoredBackgroundTasks),
               uiMessages,
             ),
@@ -774,6 +917,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   clearMessages: (sessionId) => {
     clearPendingTaskToolUseIds(sessionId)
+    clearPendingToolParentUseIds(sessionId)
     set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, () => ({ messages: [], activeGoal: null, streamingText: '', chatState: 'idle' })) }))
   },
 
@@ -799,9 +943,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           const shouldFlush = hasPendingStreamText && msg.state === 'idle'
           return {
             chatState: preserveStreamingTurn ? 'streaming' : msg.state,
-            ...(msg.verb && msg.verb !== 'Thinking' ? { statusVerb: msg.verb } : {}),
+            statusVerb: msg.state === 'idle'
+              ? ''
+              : msg.verb && msg.verb !== 'Thinking'
+                ? msg.verb
+                : '',
             ...(msg.tokens ? { tokenUsage: { ...session.tokenUsage, output_tokens: msg.tokens } } : {}),
-            ...(msg.state === 'idle' ? { activeThinkingId: null, statusVerb: '' } : {}),
+            ...(msg.state === 'idle' ? { activeThinkingId: null } : {}),
             ...(shouldFlush ? {
               messages: appendAssistantTextMessage(session.messages, pendingText, Date.now()),
               streamingText: '',
@@ -836,6 +984,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             activeThinkingId: null,
           }))
         } else if (msg.blockType === 'tool_use') {
+          rememberPendingToolParentUseId(sessionId, msg.toolUseId, msg.parentToolUseId)
           update(() => ({
             activeToolUseId: msg.toolUseId ?? null,
             activeToolName: msg.toolName ?? null,
@@ -889,11 +1038,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       case 'tool_use_complete': {
         const session = get().sessions[sessionId]
         const toolName = msg.toolName || session?.activeToolName || 'unknown'
+        const toolUseId = msg.toolUseId || session?.activeToolUseId || ''
+        const parentToolUseId = msg.parentToolUseId ?? getPendingToolParentUseId(sessionId, toolUseId)
+        rememberPendingToolParentUseId(sessionId, toolUseId, parentToolUseId)
         update((s) => ({
           messages: [...s.messages, {
             id: nextId(), type: 'tool_use', toolName,
-            toolUseId: msg.toolUseId || s.activeToolUseId || '',
-            input: msg.input, timestamp: Date.now(), parentToolUseId: msg.parentToolUseId,
+            toolUseId,
+            input: msg.input, timestamp: Date.now(), parentToolUseId,
           }],
           activeToolUseId: null, activeToolName: null, activeThinkingId: null, streamingToolInput: '',
         }))
@@ -906,11 +1058,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         break
       }
 
-      case 'tool_result':
+      case 'tool_result': {
+        const pendingParentToolUseId = consumePendingToolParentUseId(sessionId, msg.toolUseId)
+        const parentToolUseId = msg.parentToolUseId ?? pendingParentToolUseId
         update((s) => ({
           messages: [...s.messages, {
             id: nextId(), type: 'tool_result', toolUseId: msg.toolUseId,
-            content: msg.content, isError: msg.isError, timestamp: Date.now(), parentToolUseId: msg.parentToolUseId,
+            content: msg.content, isError: msg.isError, timestamp: Date.now(), parentToolUseId,
           }],
           chatState: 'thinking', activeThinkingId: null,
         }))
@@ -918,6 +1072,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           useCLITaskStore.getState().refreshTasks(sessionId)
         }
         break
+      }
 
       case 'permission_request':
         notifyDesktop({
@@ -1014,6 +1169,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             target: { type: 'session', sessionId },
           })
         }
+        refreshCompletedTranscriptHistory(get, sessionId)
         break
       }
 
@@ -1102,6 +1258,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           }))
           clearPendingDelta(sessionId)
           clearPendingTaskToolUseIds(sessionId)
+          clearPendingToolParentUseIds(sessionId)
           useCLITaskStore.getState().clearTasks(sessionId)
           useSessionStore.getState().updateSessionTitle(sessionId, 'New Session')
           useTabStore.getState().updateTabTitle(sessionId, 'New Session')
@@ -1183,6 +1340,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             typeof data.tool_use_id === 'string' && data.tool_use_id.trim()
               ? data.tool_use_id
               : null
+          const taskResult = readNonEmptyString(data, 'result')
           const taskStatus = data.status
           if (taskEvent) {
             const now = Date.now()
@@ -1208,6 +1366,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                           toolUseId,
                           status: taskStatus,
                           summary: taskEvent.summary,
+                          result: taskResult,
                           outputFile: taskEvent.outputFile,
                           usage: taskEvent.usage,
                         },
@@ -1527,12 +1686,14 @@ function extractTaskNotification(content: unknown): AgentTaskNotification | null
 
   const taskId = readXmlTag(xml, 'task-id') || toolUseId
   const summary = readXmlTag(xml, 'summary')
+  const result = readXmlTag(xml, 'result')
   const outputFile = readXmlTag(xml, 'output-file')
   return {
     taskId,
     toolUseId,
     status,
     ...(summary ? { summary } : {}),
+    ...(result ? { result } : {}),
     ...(outputFile ? { outputFile } : {}),
   }
 }
@@ -1603,13 +1764,24 @@ function pushAssistantHistoryText(
   content: string,
   timestamp: number,
   model?: string,
+  transcriptMessageId?: string,
 ): void {
   if (!content.trim()) return
 
   const last = messages[messages.length - 1]
-  if (last?.type === 'assistant_text') {
+  const canMergeIntoLast =
+    last?.type === 'assistant_text' &&
+    (
+      transcriptMessageId
+        ? last.transcriptMessageId === transcriptMessageId
+        : !last.transcriptMessageId
+    )
+  if (canMergeIntoLast) {
     last.content += content
     if (model && !last.model) last.model = model
+    if (transcriptMessageId && !last.transcriptMessageId) {
+      last.transcriptMessageId = transcriptMessageId
+    }
     return
   }
 
@@ -1618,6 +1790,7 @@ function pushAssistantHistoryText(
     type: 'assistant_text',
     content,
     timestamp,
+    ...(transcriptMessageId ? { transcriptMessageId } : {}),
     ...(model ? { model } : {}),
   })
 }
@@ -1818,6 +1991,7 @@ export function mapHistoryMessagesToUiMessages(
           id: msg.id || nextId(),
           type: 'user_text',
           content: teammateContents.join('\n\n'),
+          ...(msg.id ? { transcriptMessageId: msg.id } : {}),
           timestamp,
         })
         continue
@@ -1827,6 +2001,7 @@ export function mapHistoryMessagesToUiMessages(
         id: msg.id || nextId(),
         type: 'user_text',
         content: parsed.content,
+        ...(msg.id ? { transcriptMessageId: msg.id } : {}),
         ...(parsed.modelContent ? { modelContent: parsed.modelContent } : {}),
         ...(parsed.attachments ? { attachments: parsed.attachments } : {}),
         timestamp,
@@ -1835,13 +2010,22 @@ export function mapHistoryMessagesToUiMessages(
     }
     if (msg.type === 'assistant' && typeof msg.content === 'string') {
       if (!msg.content.trim()) continue
-      uiMessages.push({ id: msg.id || nextId(), type: 'assistant_text', content: msg.content, timestamp, model: msg.model })
+      uiMessages.push({
+        id: msg.id || nextId(),
+        type: 'assistant_text',
+        content: msg.content,
+        ...(msg.id ? { transcriptMessageId: msg.id } : {}),
+        timestamp,
+        model: msg.model,
+      })
       continue
     }
     if ((msg.type === 'assistant' || msg.type === 'tool_use') && Array.isArray(msg.content)) {
       for (const block of msg.content as AssistantHistoryBlock[]) {
         if (block.type === 'thinking' && block.thinking) uiMessages.push({ id: nextId(), type: 'thinking', content: block.thinking, timestamp })
-        else if (block.type === 'text' && block.text) pushAssistantHistoryText(uiMessages, block.text, timestamp, msg.model)
+        else if (block.type === 'text' && block.text) {
+          pushAssistantHistoryText(uiMessages, block.text, timestamp, msg.model, msg.id || undefined)
+        }
         else if (block.type === 'tool_use') uiMessages.push({ id: nextId(), type: 'tool_use', toolName: block.name ?? 'unknown', toolUseId: block.id ?? '', input: block.input, timestamp, parentToolUseId: msg.parentToolUseId })
       }
       continue
@@ -1867,6 +2051,7 @@ export function mapHistoryMessagesToUiMessages(
           id: msg.id || nextId(),
           type: 'user_text',
           content: parsed.content,
+          ...(msg.id ? { transcriptMessageId: msg.id } : {}),
           ...(parsed.modelContent ? { modelContent: parsed.modelContent } : {}),
           attachments: allAttachments.length > 0 ? allAttachments : undefined,
           timestamp,

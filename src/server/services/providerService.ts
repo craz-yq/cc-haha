@@ -20,6 +20,10 @@ import type { AnthropicRequest, AnthropicResponse } from '../proxy/transform/typ
 import { PROVIDER_PRESETS } from '../config/providerPresets.js'
 import { MODEL_CONTEXT_WINDOWS_ENV_KEY } from '../../utils/model/modelContextWindows.js'
 import {
+  ATTRIBUTION_HEADER_ENV_KEY,
+  attributionHeaderEnvForModel,
+} from './attributionHeaderPolicy.js'
+import {
   OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
   OPENAI_OFFICIAL_PROVIDER,
   OPENAI_OAUTH_PROVIDER_ENV_KEY,
@@ -55,6 +59,7 @@ const MANAGED_ENV_KEYS = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
   'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+  ATTRIBUTION_HEADER_ENV_KEY,
   MODEL_CONTEXT_WINDOWS_ENV_KEY,
   OPENAI_OAUTH_PROVIDER_ENV_KEY,
   OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
@@ -101,11 +106,22 @@ function isSavedProvider(value: unknown): value is SavedProvider {
   )
 }
 
+function normalizeModelMapping(models: SavedProvider['models']): SavedProvider['models'] {
+  const main = models.main.trim()
+  return {
+    main,
+    haiku: models.haiku.trim() || main,
+    sonnet: models.sonnet.trim() || main,
+    opus: models.opus.trim() || main,
+  }
+}
+
 function normalizeSavedProvider(provider: SavedProvider): SavedProvider {
   return {
     ...provider,
     apiFormat: provider.apiFormat ?? 'anthropic',
     runtimeKind: provider.runtimeKind ?? 'anthropic_compatible',
+    models: normalizeModelMapping(provider.models),
   }
 }
 
@@ -292,7 +308,7 @@ export class ProviderService {
       baseUrl: input.baseUrl,
       apiFormat: input.apiFormat ?? 'anthropic',
       runtimeKind: input.runtimeKind ?? 'anthropic_compatible',
-      models: input.models,
+      models: normalizeModelMapping(input.models),
       ...(input.autoCompactWindow !== undefined && { autoCompactWindow: input.autoCompactWindow }),
       ...(input.modelContextWindows !== undefined && { modelContextWindows: input.modelContextWindows }),
       ...(input.notes !== undefined && { notes: input.notes }),
@@ -317,7 +333,7 @@ export class ProviderService {
       ...(input.baseUrl !== undefined && { baseUrl: input.baseUrl }),
       ...(input.apiFormat !== undefined && { apiFormat: input.apiFormat }),
       ...(input.runtimeKind !== undefined && { runtimeKind: input.runtimeKind }),
-      ...(input.models !== undefined && { models: input.models }),
+      ...(input.models !== undefined && { models: normalizeModelMapping(input.models) }),
       ...(typeof input.autoCompactWindow === 'number' && { autoCompactWindow: input.autoCompactWindow }),
       ...(input.modelContextWindows !== undefined && input.modelContextWindows !== null && { modelContextWindows: input.modelContextWindows }),
       ...(input.notes !== undefined && { notes: input.notes }),
@@ -426,6 +442,7 @@ export class ProviderService {
       ANTHROPIC_DEFAULT_HAIKU_MODEL: provider.models.haiku,
       ANTHROPIC_DEFAULT_SONNET_MODEL: provider.models.sonnet,
       ANTHROPIC_DEFAULT_OPUS_MODEL: provider.models.opus,
+      ...attributionHeaderEnvForModel(provider.models.main),
     }
   }
 

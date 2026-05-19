@@ -89,6 +89,7 @@ export type SessionTaskNotification = {
   toolUseId: string
   status: 'completed' | 'failed' | 'stopped'
   summary?: string
+  result?: string
   outputFile?: string
   timestamp?: string
 }
@@ -533,12 +534,14 @@ export class SessionService {
 
     const taskId = this.readXmlTag(xml, 'task-id') || toolUseId
     const summary = this.readXmlTag(xml, 'summary')
+    const result = this.readXmlTag(xml, 'result')
     const outputFile = this.readXmlTag(xml, 'output-file')
     return {
       taskId,
       toolUseId,
       status,
       ...(summary ? { summary } : {}),
+      ...(result ? { result } : {}),
       ...(outputFile ? { outputFile } : {}),
       ...(timestamp ? { timestamp } : {}),
     }

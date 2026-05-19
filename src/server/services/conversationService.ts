@@ -30,6 +30,7 @@ import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 import { findCanonicalGitRoot } from '../../utils/git.js'
 import { sanitizePath } from '../../utils/path.js'
 import { getProcessEnvWithTerminalShellEnvironment } from '../../utils/terminalShellEnvironment.js'
+import { attributionHeaderEnvForModel } from './attributionHeaderPolicy.js'
 
 const MAX_CAPTURED_PROCESS_LINES = 80
 const MAX_CAPTURED_SDK_MESSAGES = 40
@@ -889,6 +890,7 @@ export class ConversationService {
       'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
       'CC_HAHA_SEND_DISABLED_THINKING',
       'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+      'CLAUDE_CODE_ATTRIBUTION_HEADER',
       'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS',
       OPENAI_OAUTH_PROVIDER_ENV_KEY,
       OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
@@ -919,6 +921,11 @@ export class ConversationService {
     if (explicitProviderEnv && options?.model?.trim()) {
       explicitProviderEnv.ANTHROPIC_MODEL = options.model.trim()
     }
+    const attributionHeaderEnv = attributionHeaderEnvForModel(
+      options?.model?.trim() ||
+        explicitProviderEnv?.ANTHROPIC_MODEL ||
+        cleanEnv.ANTHROPIC_MODEL,
+    )
 
     const cliDiagnosticsPath = diagnosticsService.getCliDiagnosticsPath()
     try {
@@ -963,6 +970,7 @@ export class ConversationService {
       ...(this.shouldMarkManagedOAuth(options?.providerId)
         ? await this.buildOfficialOAuthEnv()
         : {}),
+      ...attributionHeaderEnv,
     }
   }
 
@@ -1040,6 +1048,7 @@ export class ConversationService {
         'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
         'CC_HAHA_SEND_DISABLED_THINKING',
         'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+        'CLAUDE_CODE_ATTRIBUTION_HEADER',
         'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS',
         OPENAI_OAUTH_PROVIDER_ENV_KEY,
         OPENAI_CODEX_OAUTH_FILE_ENV_KEY,
